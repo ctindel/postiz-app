@@ -591,6 +591,11 @@ export class LinkedinProvider extends SocialAbstract implements SocialProvider {
     const actor =
       type === 'personal' ? `urn:li:person:${id}` : `urn:li:organization:${id}`;
 
+    // LinkedIn needs time to index a new post before the socialActions
+    // comment endpoint can find it; without this delay, comments on
+    // just-created posts fail with 404 from the domain authorization endpoint
+    await new Promise((resolve) => setTimeout(resolve, 15000));
+
     const response = await this.fetch(
       `https://api.linkedin.com/v2/socialActions/${encodeURIComponent(
         parentPostId
