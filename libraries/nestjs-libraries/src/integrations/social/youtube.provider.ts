@@ -56,8 +56,6 @@ export class YoutubeProvider extends SocialAbstract implements SocialProvider {
   isBetweenSteps = true;
   dto = YoutubeSettingsDto;
   scopes = [
-    'https://www.googleapis.com/auth/userinfo.profile',
-    'https://www.googleapis.com/auth/userinfo.email',
     'https://www.googleapis.com/auth/youtube',
     'https://www.googleapis.com/auth/youtube.force-ssl',
     'https://www.googleapis.com/auth/youtube.readonly',
@@ -136,25 +134,54 @@ export class YoutubeProvider extends SocialAbstract implements SocialProvider {
   }
 
   async refreshToken(refresh_token: string): Promise<AuthTokenDetails> {
-    const { client, oauth2 } = clientAndYoutube();
+    const { client, youtube } = clientAndYoutube();
     client.setCredentials({ refresh_token });
     const { credentials } = await client.refreshAccessToken();
-    const user = oauth2(client);
+
     const expiryDate = new Date(credentials.expiry_date!);
     const unixTimestamp =
       Math.floor(expiryDate.getTime() / 1000) -
       Math.floor(new Date().getTime() / 1000);
 
-    const { data } = await user.userinfo.get();
+    // Try to fetch channel metadata, but don't fail the token refresh if
+    // the channel lookup fails (quota, network, transient API errors).
+    // Throwing here would cause RefreshIntegrationService to disconnect the
+    // user unnecessarily.
+    let channelId = '';
+    let channelName = '';
+    let channelPicture = '';
+    let channelUsername = '';
+
+    try {
+      const youtubeClient = youtube(client);
+      const response = await youtubeClient.channels.list({
+        part: ['snippet'],
+        mine: true,
+      });
+      const channel = response.data.items?.[0];
+      if (channel?.id) {
+        channelId = channel.id;
+        channelName = channel.snippet?.title || '';
+        channelPicture = channel.snippet?.thumbnails?.default?.url || '';
+        channelUsername = channel.snippet?.customUrl || '';
+      }
+    } catch (error) {
+      // Channel metadata fetch failed (quota, network, transient API error).
+      // Return refreshed tokens anyway to avoid unnecessary disconnects.
+      console.warn(
+        'Failed to fetch YouTube channel info during token refresh:',
+        error
+      );
+    }
 
     return {
       accessToken: credentials.access_token!,
       expiresIn: unixTimestamp!,
       refreshToken: credentials.refresh_token ?? refresh_token,
-      id: data.id!,
-      name: data.name!,
-      picture: data?.picture || '',
-      username: '',
+      id: channelId,
+      name: channelName,
+      picture: channelPicture,
+      username: channelUsername,
     };
   }
 
@@ -164,7 +191,7 @@ export class YoutubeProvider extends SocialAbstract implements SocialProvider {
     return {
       url: client.generateAuthUrl({
         access_type: 'offline',
-        prompt: 'consent',
+        prompt: 'consent select_account',
         state,
         redirect_uri: `${process.env.FRONTEND_URL}/integrations/social/youtube`,
         scope: this.scopes.slice(0),
@@ -179,14 +206,34 @@ export class YoutubeProvider extends SocialAbstract implements SocialProvider {
     codeVerifier: string;
     refresh?: string;
   }) {
-    const { client, oauth2 } = clientAndYoutube();
+    const { client, youtube } = clientAndYoutube();
     const { tokens } = await client.getToken(params.code);
     client.setCredentials(tokens);
-    const { scopes } = await client.getTokenInfo(tokens.access_token!);
-    this.checkScopes(this.scopes, scopes);
+    const tokenInfo = await client.getTokenInfo(tokens.access_token!);
+    this.checkScopes(this.scopes, tokenInfo.scopes);
 
-    const user = oauth2(client);
-    const { data } = await user.userinfo.get();
+    // Use the stable Google user ID from the token as the root identifier.
+    // This ensures checkPreviousConnections() can reliably detect the same
+    // Google account across reconnections. The actual channel.id is assigned
+    // later when the user picks a channel via pages().
+    const stableRootId = tokenInfo.sub || tokenInfo.user_id || '';
+    if (!stableRootId) {
+      throw new Error(
+        'Unable to determine Google account identifier from token'
+      );
+    }
+
+    // Get user info from YouTube channel instead of userinfo API
+    // to avoid requiring userinfo scopes that block Brand Account picker
+    const youtubeClient = youtube(client);
+    const response = await youtubeClient.channels.list({
+      part: ['snippet'],
+      mine: true,
+    });
+    const channel = response.data.items?.[0];
+    if (!channel) {
+      throw new Error('No YouTube channel found for this account');
+    }
 
     const expiryDate = new Date(tokens.expiry_date!);
     const unixTimestamp =
@@ -197,10 +244,10 @@ export class YoutubeProvider extends SocialAbstract implements SocialProvider {
       accessToken: tokens.access_token!,
       expiresIn: unixTimestamp,
       refreshToken: tokens.refresh_token!,
-      id: data.id!,
-      name: data.name!,
-      picture: data?.picture || '',
-      username: '',
+      id: stableRootId,
+      name: channel?.snippet?.title || '',
+      picture: channel?.snippet?.thumbnails?.default?.url || '',
+      username: channel?.snippet?.customUrl || '',
     };
   }
 
